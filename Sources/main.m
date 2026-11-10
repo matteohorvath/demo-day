@@ -91,22 +91,53 @@ static void StoreSetWantsLogin(BOOL value) {
     [NSUserDefaults.standardUserDefaults setBool:value forKey:@"wantsLogin"];
 }
 
-#pragma mark - Formatting
+static const int kMinDecimals = 0;
+static const int kMaxDecimals = 7;
+static const int kDefaultDecimals = 7;
 
-static const long long kDayScale = 10000000LL;
-
-/// Days remaining, rounded to 7 decimal places.
-static void RoundDays(NSTimeInterval remaining, long long *whole, long long *frac) {
-    long long scaled = 0;
-    if (remaining > 0) {
-        scaled = llround(remaining / 86400.0 * (double)kDayScale);
-        if (scaled < 0) scaled = 0;
-    }
-    *whole = scaled / kDayScale;
-    *frac = scaled % kDayScale;
+static int ClampDecimals(int value) {
+    if (value < kMinDecimals) return kMinDecimals;
+    if (value > kMaxDecimals) return kMaxDecimals;
+    return value;
 }
 
-static NSString *StickerText(NSTimeInterval remaining, NSString *label) {
+static int StoreDecimals(void) {
+    if ([NSUserDefaults.standardUserDefaults objectForKey:@"decimals"] == nil) return kDefaultDecimals;
+    return ClampDecimals((int)[NSUserDefaults.standardUserDefaults integerForKey:@"decimals"]);
+}
+
+static void StoreSetDecimals(int value) {
+    [NSUserDefaults.standardUserDefaults setInteger:ClampDecimals(value) forKey:@"decimals"];
+}
+
+#pragma mark - Formatting
+
+static long long DayScale(int decimals) {
+    long long scale = 1;
+    for (int i = 0; i < decimals; i++) scale *= 10LL;
+    return scale;
+}
+
+/// Days remaining, rounded to `decimals` places.
+static void RoundDays(NSTimeInterval remaining, int decimals, long long *whole, long long *frac) {
+    long long scale = DayScale(ClampDecimals(decimals));
+    long long scaled = 0;
+    if (remaining > 0) {
+        scaled = llround(remaining / 86400.0 * (double)scale);
+        if (scaled < 0) scaled = 0;
+    }
+    *whole = scaled / scale;
+    *frac = scaled % scale;
+}
+
+static NSString *DaysNumber(long long whole, long long frac, int decimals) {
+    decimals = ClampDecimals(decimals);
+    if (decimals <= 0) return [NSString stringWithFormat:@"%lld", whole];
+    NSString *format = [NSString stringWithFormat:@"%%lld.%%0%dlld", decimals];
+    return [NSString stringWithFormat:format, whole, frac];
+}
+
+static NSString *StickerText(NSTimeInterval remaining, NSString *label, int decimals) {
     NSString *mark = label.length ? label : @"Y";
     if (remaining <= 0) return [NSString stringWithFormat:@"%@  DEMO DAY", mark];
     if (remaining < 48 * 3600) {
@@ -114,15 +145,15 @@ static NSString *StickerText(NSTimeInterval remaining, NSString *label) {
         return [NSString stringWithFormat:@"%@  %02d:%02d:%02d", mark, total / 3600, (total % 3600) / 60, total % 60];
     }
     long long whole, frac;
-    RoundDays(remaining, &whole, &frac);
-    return [NSString stringWithFormat:@"%@  %lld.%07lldd", mark, whole, frac];
+    RoundDays(remaining, decimals, &whole, &frac);
+    return [NSString stringWithFormat:@"%@  %@d", mark, DaysNumber(whole, frac, decimals)];
 }
 
-static NSString *FractionText(NSTimeInterval remaining) {
+static NSString *FractionText(NSTimeInterval remaining, int decimals) {
     if (remaining <= 0) return @"Demo Day";
     long long whole, frac;
-    RoundDays(remaining, &whole, &frac);
-    return [NSString stringWithFormat:@"%lld.%07lld", whole, frac];
+    RoundDays(remaining, decimals, &whole, &frac);
+    return DaysNumber(whole, frac, decimals);
 }
 
 static NSString *BreakdownText(NSTimeInterval remaining) {
@@ -321,7 +352,7 @@ static void SyncLoginItem(void) {
         self.unit.stringValue = @"now";
         self.breakdown.stringValue = @"The countdown is over.";
     } else {
-        NSString *fraction = FractionText(remaining);
+        NSString *fraction = FractionText(remaining, StoreDecimals());
         CGFloat pointSize = 42;
         NSFont *font = RoundedFont(pointSize, NSFontWeightBold);
         CGFloat width = [fraction sizeWithAttributes:@{NSFontAttributeName: font}].width;
@@ -392,12 +423,31 @@ static void SyncLoginItem(void) {
 
 @end
 
-@interface SettingsController : NSWindowController <NSWindowDelegate>
+@class SettingsController;
+
+@interface DecimalsStepper : NSStepper
+@property (nonatomic, weak) SettingsController *owner;
+@end
+
+@interface SettingsController : NSWindowController <NSWindowDelegate, NSTextFieldDelegate>
 @property (nonatomic, copy) void (^onSave)(void);
 @property (nonatomic, strong) NSDatePicker *picker;
 @property (nonatomic, strong) NSTextField *labelField;
+@property (nonatomic, strong) NSTextField *decimalsField;
+@property (nonatomic, strong) NSStepper *decimalsStepper;
 @property (nonatomic, strong) NSTextField *preview;
 @property (nonatomic) BOOL didSave;
+@property (nonatomic) BOOL steppingDecimals;
+@end
+
+@implementation DecimalsStepper
+
+- (void)mouseDown:(NSEvent *)event {
+    self.owner.steppingDecimals = YES;
+    [super mouseDown:event];
+    self.owner.steppingDecimals = NO;
+}
+
 @end
 
 @implementation SettingsController
@@ -468,6 +518,31 @@ static void SyncLoginItem(void) {
     hint.font = RoundedFont(11, NSFontWeightRegular);
     hint.textColor = NSColor.tertiaryLabelColor;
 
+    self.decimalsField = [NSTextField textFieldWithString:[NSString stringWithFormat:@"%d", StoreDecimals()]];
+    self.decimalsField.font = RoundedFont(13, NSFontWeightSemibold);
+    self.decimalsField.alignment = NSTextAlignmentCenter;
+    self.decimalsField.delegate = self;
+    self.decimalsField.target = self;
+    self.decimalsField.action = @selector(decimalsEdited:);
+    DecimalsStepper *decimalsStepper = [DecimalsStepper new];
+    decimalsStepper.owner = self;
+    self.decimalsStepper = decimalsStepper;
+    self.decimalsStepper.minValue = kMinDecimals;
+    self.decimalsStepper.maxValue = kMaxDecimals;
+    self.decimalsStepper.increment = 1;
+    self.decimalsStepper.valueWraps = NO;
+    self.decimalsStepper.integerValue = StoreDecimals();
+    self.decimalsStepper.target = self;
+    self.decimalsStepper.action = @selector(stepDecimals:);
+    NSStackView *decimalsRow = [NSStackView stackViewWithViews:@[self.decimalsField, self.decimalsStepper]];
+    decimalsRow.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    decimalsRow.alignment = NSLayoutAttributeCenterY;
+    decimalsRow.spacing = 6;
+
+    NSTextField *decimalsHint = [NSTextField labelWithString:@"Digits after the decimal on the day count. 7 is the default."];
+    decimalsHint.font = RoundedFont(11, NSFontWeightRegular);
+    decimalsHint.textColor = NSColor.tertiaryLabelColor;
+
     NSButton *cancel = [NSButton buttonWithTitle:(StoreConfirmed() ? @"Cancel" : @"Not now")
                                           target:self
                                           action:@selector(notNow:)];
@@ -492,6 +567,9 @@ static void SyncLoginItem(void) {
         [self caption:@"Sticker label"],
         self.labelField,
         hint,
+        [self caption:@"Decimals"],
+        decimalsRow,
+        decimalsHint,
         self.preview,
         bottom,
     ]];
@@ -504,7 +582,10 @@ static void SyncLoginItem(void) {
     [stack setCustomSpacing:12 afterView:self.picker];
     [stack setCustomSpacing:4 afterView:stack.arrangedSubviews[4]];
     [stack setCustomSpacing:2 afterView:self.labelField];
-    [stack setCustomSpacing:14 afterView:hint];
+    [stack setCustomSpacing:12 afterView:hint];
+    [stack setCustomSpacing:4 afterView:stack.arrangedSubviews[7]];
+    [stack setCustomSpacing:2 afterView:decimalsRow];
+    [stack setCustomSpacing:14 afterView:decimalsHint];
     [stack setCustomSpacing:16 afterView:self.preview];
 
     [content addSubview:stack];
@@ -516,6 +597,7 @@ static void SyncLoginItem(void) {
         [stack.widthAnchor constraintEqualToConstant:396],
         [bottom.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
         [self.labelField.widthAnchor constraintEqualToConstant:88],
+        [self.decimalsField.widthAnchor constraintEqualToConstant:56],
     ]];
 
     [self refreshPreview];
@@ -523,15 +605,64 @@ static void SyncLoginItem(void) {
     [self.window setContentSize:content.fittingSize];
 }
 
+- (void)setDecimalsControls:(int)value {
+    value = ClampDecimals(value);
+    self.decimalsField.stringValue = [NSString stringWithFormat:@"%d", value];
+    self.decimalsStepper.integerValue = value;
+}
+
+- (void)stepDecimals:(NSStepper *)sender {
+    self.steppingDecimals = YES;
+    [self setDecimalsControls:(int)sender.integerValue];
+    [self refreshPreview];
+    self.steppingDecimals = NO;
+}
+
+- (void)decimalsEdited:(id)sender {
+    [self setDecimalsControls:(int)self.decimalsField.integerValue];
+    [self refreshPreview];
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification {
+    if (notification.object != self.decimalsField) return;
+    if (self.decimalsField.stringValue.length == 0) {
+        self.decimalsStepper.integerValue = kMinDecimals;
+        [self refreshPreview];
+        return;
+    }
+    int value = (int)self.decimalsField.integerValue;
+    if (value < kMinDecimals || value > kMaxDecimals) {
+        [self setDecimalsControls:value];
+    } else {
+        self.decimalsStepper.integerValue = value;
+    }
+    [self refreshPreview];
+}
+
+- (void)controlTextDidEndEditing:(NSNotification *)notification {
+    if (notification.object != self.decimalsField) return;
+    // A click on the stepper already wrote the new value. Don't put the old digits back.
+    if (self.steppingDecimals || self.window.firstResponder == self.decimalsStepper) {
+        [self refreshPreview];
+        return;
+    }
+    [self setDecimalsControls:(int)self.decimalsField.integerValue];
+    [self refreshPreview];
+}
+
 - (void)refreshPreview {
     NSString *trimmed = [self.labelField.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (trimmed.length == 0) trimmed = @"Y";
     NSTimeInterval remaining = self.picker.dateValue.timeIntervalSinceNow;
-    self.preview.stringValue = [NSString stringWithFormat:@"Sticker reads   %@", StickerText(remaining, trimmed)];
+    int decimals = self.decimalsField ? ClampDecimals((int)self.decimalsField.integerValue) : StoreDecimals();
+    self.preview.stringValue = [NSString stringWithFormat:@"Sticker reads   %@", StickerText(remaining, trimmed, decimals)];
 }
 
 - (void)save:(id)sender {
+    [self.window endEditingFor:nil];
+    [self setDecimalsControls:(int)self.decimalsField.integerValue];
     StoreSetLabel(self.labelField.stringValue);
+    StoreSetDecimals((int)self.decimalsField.integerValue);
     StoreSetTarget(self.picker.dateValue);
     StoreSetConfirmed(YES);
     self.didSave = YES;
@@ -626,7 +757,7 @@ static void SyncLoginItem(void) {
 
 - (void)tick {
     NSTimeInterval remaining = StoreTarget().timeIntervalSinceNow;
-    NSString *text = StickerText(remaining, StoreLabel());
+    NSString *text = StickerText(remaining, StoreLabel(), StoreDecimals());
     if (![text isEqualToString:self.lastSticker]) {
         self.lastSticker = text;
         NSImage *image = MakeSticker(text);
@@ -692,7 +823,7 @@ static void SyncLoginItem(void) {
         fprintf(stderr, "WIN %ld %s\n", (long)window.windowNumber, NSStringFromRect(window.frame).UTF8String);
     }
     NSTimeInterval remaining = StoreTarget().timeIntervalSinceNow;
-    fprintf(stderr, "STICKER %s\n", StickerText(remaining, StoreLabel()).UTF8String);
+    fprintf(stderr, "STICKER %s\n", StickerText(remaining, StoreLabel(), StoreDecimals()).UTF8String);
     fflush(stderr);
 }
 
